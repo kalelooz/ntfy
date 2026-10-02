@@ -44,6 +44,7 @@ func TestReadMailBody_Charset(t *testing.T) {
 		{"html", "text/html; charset=ISO-8859-2", "8bit", "<p>" + latin2 + "</p>", polish, ""},
 		{"html_qp_sanitized", "text/html; charset=ISO-8859-2", "quoted-printable", "<script>alert(1)</script><p>Za=BF=F3=B3=E6 g=EA=B6l=B1 ja=BC=F1</p>", polish, ""},
 		{"html_base64", "text/html; charset=ISO-8859-2", "base64", base64.StdEncoding.EncodeToString([]byte("<p>" + latin2 + "</p>")), polish, ""},
+		{"html_cp1252_alias", "text/html; charset=cp1252", "8bit", "<p>Price \x80</p>", "Price €", ""},
 		{"unknown", "text/plain; charset=x-unknown", "8bit", "Printer ready", "", `mime: unhandled charset "x-unknown"`},
 		{"unsupported", "text/plain; charset=utf-7", "8bit", "Printer ready", "", `mime: unhandled charset "utf-7"`},
 		{"unknown_8bit", "text/plain; charset=unknown-8bit", "8bit", "Printer ready", "", `mime: unhandled charset "unknown-8bit"`},
@@ -109,6 +110,13 @@ func TestReadMailBody_CharsetMultipart(t *testing.T) {
 			})
 		}
 	}
+
+	t.Run("alias_in_multipart_html", func(t *testing.T) {
+		body := "--boundary\r\nContent-Type: text/html; charset=cp1252\r\nContent-Transfer-Encoding: 8bit\r\n\r\n<p>Price \x80</p>\r\n--boundary--\r\n"
+		decoded, err := readMailBody(strings.NewReader(body), mail.Header{"Content-Type": {"multipart/alternative; boundary=boundary"}})
+		require.NoError(t, err)
+		require.Equal(t, "Price €", strings.TrimSpace(decoded))
+	})
 
 	t.Run("nested_and_per_part_charset", func(t *testing.T) {
 		body := "--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n" +
