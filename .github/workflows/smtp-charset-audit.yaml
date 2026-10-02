@@ -1,0 +1,29 @@
+name: SMTP charset audit (fork only)
+on:
+  push:
+    branches: [audit/smtp-body-charsets-1964]
+permissions:
+  contents: read
+jobs:
+  smtp-charset-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Set up project Go version
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: .go-version
+      - name: Prepare backend test assets
+        run: make cli-deps-static-sites
+      - name: Check formatting and whitespace
+        run: |
+          test -z "$(gofmt -l server/smtp_server.go server/smtp_charset_test.go)"
+          git diff --check
+      - name: Run SMTP and charset regressions with race detection
+        run: go test -mod=readonly -race ./server -run '^(TestReadMailBody_Charset|TestSmtpBackend_|FuzzReadMailBodyCharset)' -count=1 -timeout=5m -v
+      - name: Vet server
+        run: go vet ./server
+      - name: Fuzz charset parser
+        run: go test -mod=readonly ./server -run '^$' -fuzz '^FuzzReadMailBodyCharset$' -fuzztime=20s -parallel=2 -timeout=90s
