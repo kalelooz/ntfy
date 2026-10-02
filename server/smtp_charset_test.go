@@ -34,6 +34,9 @@ func TestReadMailBody_Charset(t *testing.T) {
 		{"shift_jis", "text/plain; charset=Shift_JIS", "base64", base64.StdEncoding.EncodeToString([]byte("\x93\xfa\x96\x7b")), "日本", ""},
 		{"utf8", "text/plain; charset=UTF-8", "8bit", polish + " 🎅", polish + " 🎅", ""},
 		{"ascii", "text/plain; charset=US-ASCII", "7bit", "Printer ready", "Printer ready", ""},
+		{"utf8_alias", "text/plain; charset=utf8", "8bit", polish + " 🎅", polish + " 🎅", ""},
+		{"ascii_alias", "text/plain; charset=ascii", "7bit", "Printer ready", "Printer ready", ""},
+		{"cp1252_alias", "text/plain; charset=cp1252", "8bit", "Price \x80", "Price €", ""},
 		{"missing_charset", "text/plain", "8bit", polish, polish, ""},
 		{"missing_content_type", "", "8bit", polish, polish, ""},
 		{"missing_content_type_base64", "", "base64", base64.StdEncoding.EncodeToString([]byte(polish)), polish, ""},
@@ -43,6 +46,8 @@ func TestReadMailBody_Charset(t *testing.T) {
 		{"html_base64", "text/html; charset=ISO-8859-2", "base64", base64.StdEncoding.EncodeToString([]byte("<p>" + latin2 + "</p>")), polish, ""},
 		{"unknown", "text/plain; charset=x-unknown", "8bit", "Printer ready", "", `mime: unhandled charset "x-unknown"`},
 		{"unsupported", "text/plain; charset=utf-7", "8bit", "Printer ready", "", `mime: unhandled charset "utf-7"`},
+		{"unknown_8bit", "text/plain; charset=unknown-8bit", "8bit", "Printer ready", "", `mime: unhandled charset "unknown-8bit"`},
+		{"replacement", "text/plain; charset=iso-2022-kr", "8bit", "Printer ready", "", `mime: unhandled charset "iso-2022-kr"`},
 		{"invalid_base64", "text/plain; charset=ISO-8859-2", "base64", "%%%%", "", "illegal base64 data"},
 		{"truncated_base64", "text/plain; charset=ISO-8859-2", "base64", "WmE", "", "unexpected EOF"},
 	}
@@ -115,7 +120,7 @@ func TestReadMailBody_CharsetMultipart(t *testing.T) {
 		require.Equal(t, "Drukarka błąd", strings.TrimSpace(decoded))
 	})
 
-	for _, charset := range []string{"x-unknown", "utf-7"} {
+	for _, charset := range []string{"x-unknown", "utf-7", "unknown-8bit", "iso-2022-kr"} {
 		t.Run(charset, func(t *testing.T) {
 			body := "--boundary\r\nContent-Type: text/plain; charset=" + charset + "\r\n\r\ntext\r\n--boundary--\r\n"
 			decoded, err := readMailBody(strings.NewReader(body), mail.Header{"Content-Type": {"multipart/alternative; boundary=boundary"}})
@@ -152,6 +157,36 @@ func TestSmtpBackend_BodyCharsetPublish(t *testing.T) {
 				require.Nil(t, messages[0].Attachment)
 			})
 		}
+	}
+}
+
+func TestSmtpBackend_BodyCharsetAliases(t *testing.T) {
+	tests := []struct {
+		name, charset, body, want string
+	}{
+		{"utf8", "utf8", "Zażółć gęślą jaźń", "Zażółć gęślą jaźń"},
+		{"ascii", "ascii", "Printer ready", "Printer ready"},
+		{"cp1252", "cp1252", "Price \x80", "Price €"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := newTestConfig(t, "")
+			conf.AttachmentCacheDir = ""
+			publisher := newTestServer(t, conf)
+			s, conn, _, _ := newTestSMTPServer(t, publisher.handle)
+			defer s.Close()
+			defer conn.Close()
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			client := textproto.NewConn(conn)
+			sendCharsetSMTPData(t, client, "Content-Type: text/plain; charset="+tt.charset+"\r\n"+
+				"Content-Transfer-Encoding: 8bit\r\n\r\n"+tt.body+"\r\n", 250)
+			response := request(t, publisher, "GET", "/mytopic/json?poll=1", "", nil)
+			require.Equal(t, 200, response.Code)
+			messages := toMessages(t, response.Body.String())
+			require.Len(t, messages, 1)
+			require.Equal(t, tt.want, messages[0].Message)
+			require.Nil(t, messages[0].Attachment)
+		})
 	}
 }
 
