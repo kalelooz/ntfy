@@ -2,28 +2,145 @@ name: SMTP charset alias audit
 on:
   push:
     branches: [audit/smtp-charset-aliases-1964]
+concurrency:
+  group: ntfy-1964-final-alias-audit
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      fingerprint: ${{ steps.fingerprint.outputs.value }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: '.go-version'
-      - name: Prepare backend test assets
-        run: make cli-deps-static-sites
-      - name: Check formatting and whitespace
+      - name: Prepare backend assets and check the complete patch
         run: |
-          test -z "$(gofmt -l server/smtp_server.go server/smtp_charset_test.go)"
-          git diff --check HEAD^
-      - name: Run SMTP regressions with race detection
-        run: go test -mod=readonly -race ./server -run '^(TestReadMailBody_Charset|TestSmtpBackend_)' -count=1 -timeout=5m -v
-      - name: Vet server
-        run: go vet ./server
-      - name: Fuzz charset parser
-        run: go test ./server -run '^$' -fuzz '^FuzzReadMailBodyCharset$' -fuzztime=60s
+          make cli-deps-static-sites
+          test -z "$(gofmt -l server/smtp_server.go server/smtp_charset_test.go server/smtp_server_test.go server/smtp_charset_alias_test.go)"
+          git diff --check 39f5935b1cfbd2e4b2387236bfb0ecf7515f43e2 HEAD
+      - name: Prove alias regressions fail on the previous PR version
+        run: |
+          cp server/smtp_server.go "$RUNNER_TEMP/smtp-final.go"
+          trap 'cp "$RUNNER_TEMP/smtp-final.go" server/smtp_server.go' EXIT
+          git show 39f5935b1cfbd2e4b2387236bfb0ecf7515f43e2:server/smtp_server.go > server/smtp_server.go
+          set +e
+          go test -mod=readonly ./server -run '^TestReadMailCharset_AliasSafety$' -count=1 -timeout=3m -json > "$RUNNER_TEMP/before.json"
+          result=$?
+          set -e
+          test "$result" -ne 0
+          python3 - <<'PY'
+          import json, os
+          events = [json.loads(line) for line in open(os.environ['RUNNER_TEMP'] + '/before.json') if line.startswith('{')]
+          failed = {e.get('Test') for e in events if e.get('Action') == 'fail'}
+          expected = {'TestReadMailCharset_AliasSafety/' + name for name in ('utf8_alias', 'ascii_alias', 'windows_alias')}
+          assert expected <= failed, 'Expected runtime failures were not reproduced: ' + repr(failed)
+          print('Confirmed old-code failures:', sorted(expected))
+          PY
+      - name: Repeated SMTP, publishing and attachment regressions with race detection
+        run: |
+          go test -mod=readonly -race ./server -run '^(TestReadMail|TestSmtpBackend_|TestServer_.*(Publish|Attachment|UnifiedPush|Template)|FuzzReadMail)' -count=2 -shuffle=on -timeout=7m -json > "$RUNNER_TEMP/targeted.json" || { tail -150 "$RUNNER_TEMP/targeted.json"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          events = [json.loads(line) for line in open(os.environ['RUNNER_TEMP'] + '/targeted.json') if line.startswith('{')]
+          passed = [e for e in events if e.get('Action') == 'pass' and e.get('Test')]
+          print('Passing test/subtest executions:', len(passed))
+          print('Passing alias end-to-end cases:', sum(e['Test'].startswith('TestSmtpBackend_CharsetAliasEndToEnd/') for e in passed))
+          PY
+      - name: Static analysis
+        run: go vet -mod=readonly ./server
+      - name: Fuzz transfer and body decoding
+        run: go test -mod=readonly ./server -run '^$' -fuzz '^FuzzReadMailBodyCharset$' -fuzztime=60s -parallel=2 -timeout=3m
+      - name: Fuzz charset aliases and unsupported encodings
+        run: go test -mod=readonly ./server -run '^$' -fuzz '^FuzzReadMailCharsetAliases$' -fuzztime=60s -parallel=2 -timeout=3m
+      - name: Fingerprint validated source files
+        id: fingerprint
+        run: |
+          git diff --exit-code -- server/smtp_server.go server/smtp_server_test.go server/smtp_charset_test.go server/smtp_charset_alias_test.go go.mod go.sum
+          value=$(sha256sum server/smtp_server.go server/smtp_server_test.go server/smtp_charset_test.go server/smtp_charset_alias_test.go | sha256sum | cut -d' ' -f1)
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+          echo "Validated source fingerprint: $value"
+  full-go-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ntfy
+          POSTGRES_PASSWORD: ntfy
+          POSTGRES_DB: ntfy_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ntfy"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NTFY_TEST_DATABASE_URL: postgres://ntfy:ntfy@localhost:5432/ntfy_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: '.go-version'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build real documentation and web assets for backend tests
+        run: make docs web
+      - name: Run all Go packages with SQLite and PostgreSQL
+        run: |
+          go test -mod=readonly ./... -count=1 -timeout=12m -json > "$RUNNER_TEMP/all-go.json" || { tail -200 "$RUNNER_TEMP/all-go.json"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          events = [json.loads(line) for line in open(os.environ['RUNNER_TEMP'] + '/all-go.json') if line.startswith('{')]
+          passed = [e for e in events if e.get('Action') == 'pass' and e.get('Test')]
+          skipped = [e.get('Test') for e in events if e.get('Action') == 'skip' and e.get('Test')]
+          print('Passing test/subtest executions:', len(passed))
+          print('Skipped tests:', skipped)
+          PY
+      - name: Confirm dependencies were not changed
+        run: git diff --exit-code -- go.mod go.sum web/package-lock.json
+  publish-reviewed-patch:
+    needs: [validate, full-go-suite]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout existing PR head without running project code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 39f5935b1cfbd2e4b2387236bfb0ecf7515f43e2
+          fetch-depth: 0
+      - name: Copy only the validated patch and verify its fingerprint
+        env:
+          EXPECTED: ${{ needs.validate.outputs.fingerprint }}
+        run: |
+          git restore --source="$GITHUB_SHA" -- server/smtp_server.go server/smtp_server_test.go server/smtp_charset_test.go server/smtp_charset_alias_test.go
+          actual=$(sha256sum server/smtp_server.go server/smtp_server_test.go server/smtp_charset_test.go server/smtp_charset_alias_test.go | sha256sum | cut -d' ' -f1)
+          test "$actual" = "$EXPECTED"
+          git diff --check
+          git add server/smtp_server.go server/smtp_server_test.go server/smtp_charset_test.go server/smtp_charset_alias_test.go
+          test "$(git diff --cached --name-only | wc -l)" -eq 4
+          git diff --cached --stat
+      - name: Fast-forward the PR only if nobody changed it
+        run: |
+          test "$(git ls-remote origin refs/heads/fix/smtp-subject-charsets | cut -f1)" = 39f5935b1cfbd2e4b2387236bfb0ecf7515f43e2
+          git config user.name kalelooz
+          git config user.email 212041863+kalelooz@users.noreply.github.com
+          git commit -m "fix(smtp): accept charset aliases without lossy replacement decoding" -m "Keep IANA MIME mappings first and fall back to htmlindex for common aliases. Reject replacement-only and unsupported encodings instead of losing message text. Add subject, body, multipart, rejection, stream-error and end-to-end regression coverage." -m "Thanks to @Juice-de-Orange for spotting the alias compatibility gap and replacement-decoder trap in binwiederhier/ntfy#1964."
+          git push origin HEAD:refs/heads/fix/smtp-subject-charsets
+          git rev-parse HEAD
