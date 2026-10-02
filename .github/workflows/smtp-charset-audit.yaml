@@ -5,25 +5,119 @@ on:
 permissions:
   contents: read
 jobs:
-  smtp-charset-audit:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      server_hash: ${{ steps.hashes.outputs.server_hash }}
+      test_hash: ${{ steps.hashes.outputs.test_hash }}
     steps:
-      - name: Checkout
+      - name: Checkout immutable candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 08a5d5324d928aa4c05418e9c1af776a8ed6ea26
+          fetch-depth: 5
+          persist-credentials: false
       - name: Set up project Go version
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: .go-version
       - name: Prepare backend test assets
         run: make cli-deps-static-sites
-      - name: Check formatting and whitespace
+      - name: Demonstrate regressions on subject-only implementation
+        shell: bash
         run: |
-          test -z "$(gofmt -l server/smtp_server.go server/smtp_charset_test.go)"
+          cp server/smtp_server.go /tmp/smtp-candidate.go
+          trap 'cp /tmp/smtp-candidate.go server/smtp_server.go' EXIT
+          git show 66ed9a030dbff52b6891c65f89cd98858be499eb:server/smtp_server.go > server/smtp_server.go
+          if go test -mod=readonly ./server -run '^(TestSmtpBackend_BodyCharsetPublish|TestServer_PublishMessageSizeBoundary)$' -count=1 -timeout=3m -v > /tmp/before.log 2>&1; then
+            cat /tmp/before.log
+            echo 'Expected baseline regressions to fail' >&2
+            exit 1
+          fi
+          cat /tmp/before.log
+          grep -q -- '--- FAIL: TestSmtpBackend_BodyCharsetPublish' /tmp/before.log
+          grep -q -- '--- FAIL: TestServer_PublishMessageSizeBoundary' /tmp/before.log
+          grep -q 'attachments not allowed' /tmp/before.log
+      - name: Apply exact reviewed corrections
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('server/server.go')
+          text = path.read_text()
+          old = '\tbody, err := util.Peek(r.Body, s.config.MessageSizeLimit)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tm := model.NewDefaultMessage(t.ID, "")'
+          new = '\t// Peek one extra byte to distinguish an exact-size message from an\n\t// attachment. Cap the preview; the reader still replays every byte.\n\tbody, err := util.Peek(r.Body, s.config.MessageSizeLimit+1)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tif len(body.PeekedBytes) > s.config.MessageSizeLimit {\n\t\tbody.PeekedBytes = body.PeekedBytes[:s.config.MessageSizeLimit]\n\t}\n\tm := model.NewDefaultMessage(t.ID, "")'
+          assert text.count(old) == 1, 'Publishing source changed'
+          path.write_text(text.replace(old, new))
+          path = Path('server/smtp_charset_test.go')
+          text = path.read_text()
+          old = '"base64", "%%%", "", "illegal base64 data"'
+          new = '"base64", "%%%%", "", "illegal base64 data"'
+          assert text.count(old) == 1, 'Malformed-input fixture changed'
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Check formatting and patch
+        run: |
+          test -z "$(gofmt -l server/server.go server/smtp_server.go server/smtp_charset_test.go server/publish_boundary_test.go)"
           git diff --check
-      - name: Run SMTP and charset regressions with race detection
-        run: go test -mod=readonly -race ./server -run '^(TestReadMailBody_Charset|TestSmtpBackend_|FuzzReadMailBodyCharset)' -count=1 -timeout=5m -v
+          git diff --stat
+          git diff -- server/server.go server/smtp_charset_test.go
+      - name: Run SMTP and HTTP boundary regressions with race detection
+        run: go test -mod=readonly -race ./server -run '^(TestReadMailBody_Charset|TestSmtpBackend_|TestServer_PublishMessageSizeBoundary|FuzzReadMailBodyCharset)' -count=1 -timeout=5m -v
+      - name: Run related publishing and attachment regressions
+        run: go test -mod=readonly -race ./server -run '^TestServer_.*(Publish|Attachment|UnifiedPush|Template)' -count=1 -timeout=8m -v
       - name: Vet server
         run: go vet ./server
       - name: Fuzz charset parser
         run: go test -mod=readonly ./server -run '^$' -fuzz '^FuzzReadMailBodyCharset$' -fuzztime=20s -parallel=2 -timeout=90s
+      - name: Record validated file hashes
+        id: hashes
+        run: |
+          echo "server_hash=$(sha256sum server/server.go | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "test_hash=$(sha256sum server/smtp_charset_test.go | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+  publish-reviewed-patch:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout immutable candidate without running project code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 08a5d5324d928aa4c05418e9c1af776a8ed6ea26
+      - name: Reapply only the validated literal changes
+        env:
+          SERVER_HASH: ${{ needs.validate.outputs.server_hash }}
+          TEST_HASH: ${{ needs.validate.outputs.test_hash }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os
+          path = Path('server/server.go')
+          text = path.read_text()
+          old = '\tbody, err := util.Peek(r.Body, s.config.MessageSizeLimit)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tm := model.NewDefaultMessage(t.ID, "")'
+          new = '\t// Peek one extra byte to distinguish an exact-size message from an\n\t// attachment. Cap the preview; the reader still replays every byte.\n\tbody, err := util.Peek(r.Body, s.config.MessageSizeLimit+1)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tif len(body.PeekedBytes) > s.config.MessageSizeLimit {\n\t\tbody.PeekedBytes = body.PeekedBytes[:s.config.MessageSizeLimit]\n\t}\n\tm := model.NewDefaultMessage(t.ID, "")'
+          assert text.count(old) == 1, 'Publishing source changed'
+          path.write_text(text.replace(old, new))
+          path = Path('server/smtp_charset_test.go')
+          text = path.read_text()
+          old = '"base64", "%%%", "", "illegal base64 data"'
+          new = '"base64", "%%%%", "", "illegal base64 data"'
+          assert text.count(old) == 1, 'Malformed-input fixture changed'
+          path.write_text(text.replace(old, new))
+          for filename, key in [('server/server.go', 'SERVER_HASH'), ('server/smtp_charset_test.go', 'TEST_HASH')]:
+              assert hashlib.sha256(Path(filename).read_bytes()).hexdigest() == os.environ[key], filename + ' differs from validated source'
+          PY
+      - name: Fast-forward only the unchanged PR branch
+        run: |
+          expected=08a5d5324d928aa4c05418e9c1af776a8ed6ea26
+          actual=$(git ls-remote origin refs/heads/fix/smtp-subject-charsets | cut -f1)
+          test "$actual" = "$expected"
+          git config user.name kalelooz
+          git config user.email 212041863+kalelooz@users.noreply.github.com
+          git diff --check
+          git add server/server.go server/smtp_charset_test.go
+          git commit -m 'fix(server): keep exact-size UTF-8 notifications out of attachment handling' -m 'Probe one extra byte without losing attachment payload data or changing message limits. Also make the malformed-base64 regression use a complete invalid quantum.'
+          git push origin HEAD:refs/heads/fix/smtp-subject-charsets
+          echo "Published validated commit $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
